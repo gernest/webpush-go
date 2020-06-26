@@ -14,11 +14,11 @@ const (
 
 func main() {
 	// Decode subscription
-	s := &webpush.Subscription{}
-	json.Unmarshal([]byte(subscription), s)
+	s := webpush.Subscription{}
+	json.Unmarshal([]byte(subscription), &s)
 
 	// Send Notification
-	resp, err := webpush.SendNotification([]byte("Test"), s, &webpush.Options{
+	resp, err := webpush.SendNotification([]byte("Test"), s, webpush.Options{
 		Subscriber:      "example@example.com", // Do not include "mailto:"
 		VAPIDPublicKey:  vapidPublicKey,
 		VAPIDPrivateKey: vapidPrivateKey,

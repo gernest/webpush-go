@@ -10,11 +10,16 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	jwt "github.com/dgrijalva/jwt-go"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -62,26 +67,63 @@ type Subscription struct {
 	Keys     Keys   `json:"keys"`
 }
 
-// SendNotification sends a push notification to a subscription's endpoint
-// Message Encryption for Web Push, and VAPID protocols.
-// FOR MORE INFORMATION SEE RFC8291: https://datatracker.ietf.org/doc/rfc8291
-func SendNotification(message []byte, s *Subscription, options *Options) (*http.Response, error) {
+// Subscription represents a PushSubscription object from the Push API
+type Web struct {
+	sub     Subscription
+	opts    Options
+	once    sync.Once
+	err     error
+	encrypt func(message []byte) (*http.Request, error)
+	jwt     struct {
+		token     *jwt.Token
+		str       string
+		publicKey string
+		gen       func() (*jwt.Token, string, error)
+	}
+}
+
+func (s *Web) token() (string, error) {
+	if err := s.jwt.token.Claims.Valid(); err != nil {
+		tok, str, err := s.jwt.gen()
+		if err != nil {
+			return "", err
+		}
+		s.jwt.token = tok
+		s.jwt.str = str
+		return str, err
+	}
+	return s.jwt.str, nil
+}
+
+func New(sub Subscription, opts Options) *Web {
+	return &Web{sub: sub, opts: opts}
+}
+
+func (s *Web) init() {
+	s.initAuth()
+	if s.err != nil {
+		return
+	}
+
 	// Authentication secret (auth_secret)
-	authSecret, err := decodeSubscriptionKey(s.Keys.Auth)
+	authSecret, err := decodeSubscriptionKey(s.sub.Keys.Auth)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// dh (Diffie Hellman)
-	dh, err := decodeSubscriptionKey(s.Keys.P256dh)
+	dh, err := decodeSubscriptionKey(s.sub.Keys.P256dh)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// Generate 16 byte salt
 	salt, err := saltFunc()
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// Create the ecdh_secret shared key pair
@@ -90,7 +132,8 @@ func SendNotification(message []byte, s *Subscription, options *Options) (*http.
 	// Application server key pairs (single use)
 	localPrivateKey, x, y, err := elliptic.GenerateKey(curve, rand.Reader)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	localPublicKey := elliptic.Marshal(curve, x, y)
@@ -98,7 +141,8 @@ func SendNotification(message []byte, s *Subscription, options *Options) (*http.
 	// Combine application keys with dh
 	sharedX, sharedY := elliptic.Unmarshal(curve, dh)
 	if sharedX == nil {
-		return nil, errors.New("Unmarshal Error: Public key is not a valid point on the curve")
+		s.err = errors.New("Unmarshal Error: Public key is not a valid point on the curve")
+		return
 	}
 
 	sx, _ := curve.ScalarMult(sharedX, sharedY, localPrivateKey)
@@ -114,7 +158,8 @@ func SendNotification(message []byte, s *Subscription, options *Options) (*http.
 	prkHKDF := hkdf.New(hash, sharedECDHSecret, authSecret, prkInfoBuf.Bytes())
 	ikm, err := getHKDFKey(prkHKDF, 32)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// Derive Content Encryption Key
@@ -122,7 +167,8 @@ func SendNotification(message []byte, s *Subscription, options *Options) (*http.
 	contentHKDF := hkdf.New(hash, ikm, salt, contentEncryptionKeyInfo)
 	contentEncryptionKey, err := getHKDFKey(contentHKDF, 16)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// Derive the Nonce
@@ -130,94 +176,145 @@ func SendNotification(message []byte, s *Subscription, options *Options) (*http.
 	nonceHKDF := hkdf.New(hash, ikm, salt, nonceInfo)
 	nonce, err := getHKDFKey(nonceHKDF, 12)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	// Cipher
 	c, err := aes.NewCipher(contentEncryptionKey)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
 
 	gcm, err := cipher.NewGCM(c)
 	if err != nil {
-		return nil, err
+		s.err = err
+		return
 	}
+	s.encrypt = func(message []byte) (*http.Request, error) {
+		// Get the record size
+		recordSize := s.opts.RecordSize
+		if recordSize == 0 {
+			recordSize = MaxRecordSize
+		}
 
-	// Get the record size
-	recordSize := options.RecordSize
-	if recordSize == 0 {
-		recordSize = MaxRecordSize
+		recordLength := int(recordSize) - 16
+
+		// Encryption Content-Coding Header
+		recordBuf := bytes.NewBuffer(salt)
+		rs := make([]byte, 4)
+		binary.BigEndian.PutUint32(rs, recordSize)
+		recordBuf.Write(rs)
+		recordBuf.Write([]byte{byte(len(localPublicKey))})
+		recordBuf.Write(localPublicKey)
+		// Data
+		dataBuf := bytes.NewBuffer(message)
+
+		// Pad content to max record size - 16 - header
+		// Padding ending delimeter
+		dataBuf.Write([]byte("\x02"))
+		if err := pad(dataBuf, recordLength-recordBuf.Len()); err != nil {
+			return nil, err
+		}
+		// Compose the ciphertext
+		ciphertext := gcm.Seal([]byte{}, nonce, dataBuf.Bytes(), nil)
+		recordBuf.Write(ciphertext)
+		// POST request
+		req, err := http.NewRequest("POST", s.sub.Endpoint, recordBuf)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Encoding", "aes128gcm")
+		req.Header.Set("Content-Length", strconv.Itoa(len(ciphertext)))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("TTL", strconv.Itoa(s.opts.TTL))
+		// Сheck the optional headers
+		if len(s.opts.Topic) > 0 {
+			req.Header.Set("Topic", s.opts.Topic)
+		}
+
+		if isValidUrgency(s.opts.Urgency) {
+			req.Header.Set("Urgency", string(s.opts.Urgency))
+		}
+		// Get VAPID Authorization header
+		vapidAuthHeader, err := s.tokenHeader()
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", vapidAuthHeader)
+		return req, nil
 	}
+}
 
-	recordLength := int(recordSize) - 16
-
-	// Encryption Content-Coding Header
-	recordBuf := bytes.NewBuffer(salt)
-
-	rs := make([]byte, 4)
-	binary.BigEndian.PutUint32(rs, recordSize)
-
-	recordBuf.Write(rs)
-	recordBuf.Write([]byte{byte(len(localPublicKey))})
-	recordBuf.Write(localPublicKey)
-
-	// Data
-	dataBuf := bytes.NewBuffer(message)
-
-	// Pad content to max record size - 16 - header
-	// Padding ending delimeter
-	dataBuf.Write([]byte("\x02"))
-	if err := pad(dataBuf, recordLength-recordBuf.Len()); err != nil {
-		return nil, err
+func (s *Web) initAuth() {
+	// Create the JWT token
+	subURL, err := url.Parse(s.sub.Endpoint)
+	if err != nil {
+		s.err = err
+		return
 	}
+	// Decode the VAPID private key
+	decodedVapidPrivateKey, err := decodeVapidKey(s.opts.VAPIDPrivateKey)
+	if err != nil {
+		s.err = err
+		return
+	}
+	privKey := generateVAPIDHeaderKeys(decodedVapidPrivateKey)
+	// Decode the VAPID public key
+	pubKey, err := decodeVapidKey(s.opts.VAPIDPublicKey)
+	if err != nil {
+		s.err = err
+		return
+	}
+	s.jwt.publicKey = base64.RawURLEncoding.EncodeToString(pubKey)
+	s.jwt.gen = func() (*jwt.Token, string, error) {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, &jwt.StandardClaims{
+			Audience:  fmt.Sprintf("%s://%s", subURL.Scheme, subURL.Host),
+			ExpiresAt: time.Now().Add(time.Hour * 12).Unix(),
+			Subject:   fmt.Sprintf("mailto:%s", s.opts.Subscriber),
+		})
+		// Sign token with private key
+		jwtString, err := token.SignedString(privKey)
+		if err != nil {
+			return nil, "", err
+		}
+		return token, jwtString, nil
+	}
+}
 
-	// Compose the ciphertext
-	ciphertext := gcm.Seal([]byte{}, nonce, dataBuf.Bytes(), nil)
-	recordBuf.Write(ciphertext)
+func (s *Web) tokenHeader() (string, error) {
+	_, str, err := s.jwt.gen()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(
+		"vapid t=%s, k=%s",
+		str,
+		s.jwt.publicKey,
+	), nil
+}
 
-	// POST request
-	req, err := http.NewRequest("POST", s.Endpoint, recordBuf)
+func (s *Web) Encrypt(message []byte, options Options) (*http.Request, error) {
+	s.once.Do(s.init)
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.encrypt(message)
+}
+
+// SendNotification sends a push notification to a subscription's endpoint
+// Message Encryption for Web Push, and VAPID protocols.
+// FOR MORE INFORMATION SEE RFC8291: https://datatracker.ietf.org/doc/rfc8291
+func SendNotification(message []byte, s Subscription, options Options) (*http.Response, error) {
+	req, err := New(s, options).Encrypt(message, options)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Content-Encoding", "aes128gcm")
-	req.Header.Set("Content-Length", strconv.Itoa(len(ciphertext)))
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("TTL", strconv.Itoa(options.TTL))
-
-	// Сheck the optional headers
-	if len(options.Topic) > 0 {
-		req.Header.Set("Topic", options.Topic)
-	}
-
-	if isValidUrgency(options.Urgency) {
-		req.Header.Set("Urgency", string(options.Urgency))
-	}
-
-	// Get VAPID Authorization header
-	vapidAuthHeader, err := getVAPIDAuthorizationHeader(
-		s.Endpoint,
-		options.Subscriber,
-		options.VAPIDPublicKey,
-		options.VAPIDPrivateKey,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", vapidAuthHeader)
-
-	// Send the request
-	var client HTTPClient
 	if options.HTTPClient != nil {
-		client = options.HTTPClient
-	} else {
-		client = &http.Client{}
+		return options.HTTPClient.Do(req)
 	}
-
-	return client.Do(req)
+	return http.DefaultClient.Do(req)
 }
 
 // decodeSubscriptionKey decodes a base64 subscription key.

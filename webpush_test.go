@@ -12,8 +12,8 @@ func (*testHTTPClient) Do(*http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 201}, nil
 }
 
-func getURLEncodedTestSubscription() *Subscription {
-	return &Subscription{
+func getURLEncodedTestSubscription() Subscription {
+	return Subscription{
 		Endpoint: "https://updates.push.services.mozilla.com/wpush/v2/gAAAAA",
 		Keys: Keys{
 			P256dh: "BNNL5ZaTfK81qhXOx23-wewhigUeFb632jN6LvRWCFH1ubQr77FE_9qV1FuojuRmHP42zmf34rXgW80OvUVDgTk",
@@ -22,8 +22,8 @@ func getURLEncodedTestSubscription() *Subscription {
 	}
 }
 
-func getStandardEncodedTestSubscription() *Subscription {
-	return &Subscription{
+func getStandardEncodedTestSubscription() Subscription {
+	return Subscription{
 		Endpoint: "https://updates.push.services.mozilla.com/wpush/v2/gAAAAA",
 		Keys: Keys{
 			P256dh: "BNNL5ZaTfK81qhXOx23+wewhigUeFb632jN6LvRWCFH1ubQr77FE/9qV1FuojuRmHP42zmf34rXgW80OvUVDgTk=",
@@ -33,7 +33,7 @@ func getStandardEncodedTestSubscription() *Subscription {
 }
 
 func TestSendNotificationToURLEncodedSubscription(t *testing.T) {
-	resp, err := SendNotification([]byte("Test"), getURLEncodedTestSubscription(), &Options{
+	resp, err := SendNotification([]byte("Test"), getURLEncodedTestSubscription(), Options{
 		HTTPClient:      &testHTTPClient{},
 		RecordSize:      3070,
 		Subscriber:      "<EMAIL@EXAMPLE.COM>",
@@ -57,7 +57,7 @@ func TestSendNotificationToURLEncodedSubscription(t *testing.T) {
 }
 
 func TestSendNotificationToStandardEncodedSubscription(t *testing.T) {
-	resp, err := SendNotification([]byte("Test"), getStandardEncodedTestSubscription(), &Options{
+	resp, err := SendNotification([]byte("Test"), getStandardEncodedTestSubscription(), Options{
 		HTTPClient:      &testHTTPClient{},
 		Subscriber:      "<EMAIL@EXAMPLE.COM>",
 		Topic:           "test_topic",
@@ -79,7 +79,7 @@ func TestSendNotificationToStandardEncodedSubscription(t *testing.T) {
 }
 
 func TestSendTooLargeNotification(t *testing.T) {
-	_, err := SendNotification([]byte(strings.Repeat("Test", int(MaxRecordSize))), getStandardEncodedTestSubscription(), &Options{
+	_, err := SendNotification([]byte(strings.Repeat("Test", int(MaxRecordSize))), getStandardEncodedTestSubscription(), Options{
 		HTTPClient:      &testHTTPClient{},
 		Subscriber:      "<EMAIL@EXAMPLE.COM>",
 		Topic:           "test_topic",
