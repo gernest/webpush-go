@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 
-	webpush "github.com/SherClockHolmes/webpush-go"
+	webpush "github.com/gernest/webpush-go"
 )
 
 const (
